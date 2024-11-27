@@ -1,0 +1,436 @@
+---
+title: "mitFinalProject"
+author: "jingyun"
+date: "2024-11-22"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Installing monocle3
+
+First, install Bioconductor, and a few Bioconductor dependencies that aren't automatically installed.
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+install.packages("BiocManager")
+#BiocManager::install(version = "3.14") # for R version 4.1
+BiocManager::install(version = "3.20") # for R version 4.4
+BiocManager::install(c('BiocGenerics', 'DelayedArray', 'DelayedMatrixStats',
+                       'limma', 'lme4', 'S4Vectors', 'SingleCellExperiment',
+                       'SummarizedExperiment', 'batchelor', 'HDF5Array',
+                       'terra', 'ggrastr'))
+```
+
+Second, install monocle3 through the cole-trapnell-lab GitHub, execute:
+
+```{r, eval=FALSE}
+install.packages("devtools")
+devtools::install_github('cole-trapnell-lab/monocle3')
+devtools::install_github("immunogenomics/lisi")
+install.packages("Matrix")
+install.packages("Seurat")
+install.packages("readr")
+install.packages("data.table")
+```
+
+Lastly, check that Monocle 3 was installed correctly. Start a new R session and run:
+
+```{r}
+library(monocle3)
+library(dplyr)
+#library(lisi)
+library("Matrix")
+library(Seurat)
+library(readr)
+library(data.table)
+library(ggplot2)
+library(cluster)
+```
+
+# Load the data
+
+From <https://compbio.mit.edu/ad_aging_brain/> I used Cell type-specific data, Immune_cells.rds
+
+```{r}
+immune_cells <- readRDS("data/Immune_cells.rds")
+```
+
+Process the dataframe to match the input requirement of cds dataset. Requirements:
+
+```{r echo=FALSE}
+knitr::include_graphics("graph/requirements.png")
+```
+
+```{r}
+expression_matrix <- GetAssayData(immune_cells, layer = "counts")
+cell_metadata <- immune_cells@meta.data
+
+#Checking the dim(expression_matrix) [1] 33538 83889
+#Checking the dim(cell_metadata) [1] 83889     2
+#Match the rows of cell_metadata by names of columns of expression matrix
+head(rownames(cell_metadata))
+head(colnames(expression_matrix))
+rownames_match <- rownames(cell_metadata) %in% colnames(expression_matrix)
+summary(rownames_match)
+# they all matched
+
+# Create gene metadata
+gene_metadata <- data.frame(
+    gene_short_name = rownames(expression_matrix)  # Placeholder for gene symbols
+)
+rownames(gene_metadata) <- rownames(expression_matrix)
+#Checking the dim(expression_matrix) [1] 33538 83889
+#Checking the dim(gene_metadata) [1] 33538     1
+```
+
+```{r}
+#load batch data
+batch_data <- read_tsv("data/batch_mapping_deidentified.tsv")
+cell_metadata$batch <- batch_data$batch[match(cell_metadata$subject, batch_data$subject)]
+
+#load patient metadata and change the identifier to subject
+patient_metadata <- read_tsv("data/dataset_652_basic_05-06-2021.tsv.gz")
+linking_file <- read_tsv("data/AD427_subject_projid_mapping.tsv")
+patient_metadata$subject <- linking_file$subject[match(patient_metadata$projid, linking_file$projid)]
+
+#load most relevant columns to cell_metadata
+columns_to_add <- c("cogn_global_lv", "braaksc", "ceradsc", "amyloid")
+cell_metadata <- merge(cell_metadata, patient_metadata[, c("subject", columns_to_add)], 
+                       by = "subject", all.x = TRUE)
+
+# Restore original row names
+rownames(cell_metadata) <- colnames(expression_matrix)
+```
+
+Sample fractions of the data
+```{r}
+# Filter cell_metadata for only T-cells
+tcell_metadata <- cell_metadata[cell_metadata$cell_type_high_resolution == "T cells", ]
+
+# Ensure the columns of expression_matrix match the filtered metadata
+tcell_expression_matrix <- expression_matrix[, colnames(expression_matrix) %in% rownames(tcell_metadata)]
+
+# Check dimensions of the filtered data
+dim(tcell_metadata)
+dim(tcell_expression_matrix)
+```
+
+
+Visualize the cell metadata
+```{r}
+# 1. Distribution of cell_type_high_resolution
+numerical_vars <- c("cogn_global_lv", "braaksc", "ceradsc", "amyloid")
+for (var in numerical_vars) {
+  ggplot(cell_metadata, aes_string(x = var)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Distribution of", var), x = var, y = "Count") +
+    theme(plot.title = element_text(hjust = 0.5)) -> p
+  print(p)
+}
+```
+```{r}
+for (var in numerical_vars) {
+  ggplot(cell_metadata, aes_string(x = "cell_type_high_resolution", y = var)) +
+    geom_boxplot(fill = "steelblue", color = "black", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Boxplot of", var, "by Cell Type"), x = "Cell Type", y = var) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          plot.title = element_text(hjust = 0.5)) -> p
+  print(p)
+}
+```
+```{r}
+# Select numerical variables and calculate correlations
+cor_data <- cell_metadata[, numerical_vars]
+cor_matrix <- cor(cor_data, use = "complete.obs")
+cor_matrix
+```
+
+
+```{r}
+cds <- new_cell_data_set(expression_matrix,
+                         cell_metadata = cell_metadata,
+                         gene_metadata = gene_metadata)
+tcell <- new_cell_data_set(tcell_expression_matrix,
+                         cell_metadata = tcell_metadata,
+                         gene_metadata = gene_metadata)
+```
+
+```{r echo=FALSE}
+knitr::include_graphics("graph/workflow.png")
+```
+
+
+PCA the expression data -> does that reflect clinical transition?
+# Clustering and classifying cells
+
+```{r}
+cds <- preprocess_cds(tcell, num_dim = 25)
+```
+
+It's a good idea to check that you're using enough PCs to capture most of the variation in gene expression across all the cells in the data set. You can look at the fraction of variation explained by each PC using
+
+```{r}
+plot_pc_variance_explained(cds)
+```
+
+We can see that using more than 100 PCs would capture only a small amount of additional variation, and each additional PC makes downstream steps in Monocle slower.
+
+Reduce the dimensionality and visualize the cells
+
+```{r}
+cds <- reduce_dimension(cds)
+```
+
+```{r}
+plot_cells(cds, color_cells_by="cell_type_high_resolution", label_cell_groups=TRUE)
+```
+
+## Batch correction
+First, observe UMAP coloring the cells by batch
+
+```{r}
+plot_cells(cds, color_cells_by="batch", label_cell_groups=FALSE)
+# qualitative evaluate batch effect lisi scores...
+```
+
+```{r}
+silhouette_score <- function(expression_matrix, cell_metadata) {
+  pca_result <- prcomp(t(expression_matrix), scale. = TRUE)
+  pca_data <- pca_result$x[, 1:10]
+  
+  batch_labels <- as.numeric(as.factor(cell_metadata$batch))
+  dist_matrix <- as.matrix(dist(pca_data))
+  
+  silhouette_scores <- silhouette(batch_labels, dist_matrix)
+  
+  print(summary(silhouette_scores))
+  
+  return(silhouette_scores)
+}
+
+valid_columns <- apply(tcell_expression_matrix, 1, function(row) var(row) > 0)
+filtered_expression_matrix <- tcell_expression_matrix[valid_columns, ]
+
+silhouette_scores <- silhouette_score(filtered_expression_matrix, tcell_metadata)
+summary(silhouette_scores)
+```
+
+```{r}
+graph_silhouette <- function(silhouette_scores, batch_labels) {
+  avg_sil_width <- mean(silhouette_scores[, "sil_width"])
+  
+  plot(
+    silhouette_scores,
+    border = NA,
+    col = rainbow(length(unique(batch_labels)))[batch_labels],  # Unique colors for each batch
+    main = sprintf("Refined Silhouette Plot (Average Width: %.2f)", avg_sil_width),
+    xlab = "Silhouette Width (si)",
+    ylab = "Cluster"
+  )
+  
+  # Add a line for the average silhouette width
+  abline(v = avg_sil_width, col = "red", lty = 2, lwd = 2)
+}
+
+# Example use
+graph_silhouette(silhouette_scores, as.numeric(as.factor(tcell_metadata$batch)))
+```
+
+```{r}
+# Built in batch correction using monocle3
+cds_align <- align_cds(cds, alignment_group = "batch")
+```
+
+
+```{r}
+expression_matrix_after <- assay(cds_align)
+cell_metadata_align <- colData(cds_align)
+
+valid_columns2 <- apply(expression_matrix_after, 1, function(row) var(row) > 0)
+filtered_expression_matrix2 <- expression_matrix_after[valid_columns2, ]
+
+silhouette_after <- silhouette_score(filtered_expression_matrix2, cell_metadata_align)
+summary(silhouette_after)
+graph_silhouette(silhouette_after, as.numeric(as.factor(cell_metadata_align$batch)))
+```
+
+
+# Trajectory Analysis
+```{r}
+cds_align <- reduce_dimension(cds_align, 
+                              reduction_method = "UMAP", 
+                              preprocess_method = "PCA", umap.metric = "cosine",
+                              umap.n_neighbors = 10)
+```
+
+```{r}
+plot_cells(cds_align, color_cells_by="batch", label_cell_groups=FALSE)
+```
+
+
+
+
+## Fit a principal graph within each partition and Order the cells in pseudotime
+
+Pseudotime is an abstract unit of progress: it's simply the distance between a cell and the start of the trajectory, measured along the shortest path. The trajectory's total length is defined in terms of the total amount of transcriptional change that a cell undergoes as it moves from the starting state to the end state.
+
+```{r}
+#try to impute the cluster by the original one
+#colData(cds_align)$custom_clusters <- colData(cds_align)$cell_type
+cds_clustered <- cluster_cells(cds_align)
+cds_align <- learn_graph(cds_clustered, use_partition = FALSE)
+trajectory_plot <- plot_cells(cds_align,
+           color_cells_by = "cell_type_high_resolution",
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=TRUE)
+
+ggsave(
+  filename = "graph/trajectory_plot.pdf",  # File name
+  plot = trajectory_plot,            # The ggplot object
+  width = 8,                         # Width in inches
+  height = 6,                        # Height in inches
+  dpi = 300                          # Resolution (optional for PDFs)
+)
+trajectory_plot
+```
+
+Each leaf, denoted by light gray circles, corresponds to a different outcome (i.e. cell fate) of the trajectory. Black circles indicate branch nodes, in which cells can travel to one of several outcomes.
+
+## Map the start point by clinical patients data
+Instead of manually pick the start node, we can use a helper function.Essentially, we need to think of biologically relevant features or computational strategies to define the root nodes. 1. Since we have patients metadata, we can order them by the progression of disease.
+
+The function below works by first selecting cells that match the specified diagnosis. It then determines which trajectory graph node each cell is closest to. - [cds\@principal](mailto:cds@principal){.email}\_graph_aux[["UMAP"]]\$pr_graph_cell_proj_closest_vertex: Retrieves the mapping of each cell to its closest vertex in the principal graph, using the UMAP embedding. Next, it identifies the node that is most frequently associated with the selected cells, effectively representing the node most occupied by cells with the given diagnosis. Finally, it returns this node as the root, which can serve as the starting point for trajectory inference.
+
+```{r}
+get_earliest_principal_node <- function(cds, braaksc = 0) {
+
+    # Find cell IDs with the specified braaksc value
+  cell_ids <- which(colData(cds)[, "braaksc"] == braaksc)
+  
+  # Check if any cells match the braaksc value
+  if (length(cell_ids) == 0) {
+    stop("No cells with the specified braaksc value.")
+  }
+  
+  # Retrieve the closest vertex information for each cell
+  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  
+  # Identify the root principal node based on the most frequent vertex
+  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[
+    as.numeric(names(which.max(table(closest_vertex[cell_ids, ]))))
+  ]
+  
+  # Return the root principal node(s)
+  return(root_pr_nodes)
+}
+
+# Example Usage
+cds_root <- order_cells(
+  cds_align, 
+  root_pr_nodes = get_earliest_principal_node(cds_align, braaksc = 0)
+)
+
+```
+
+```{r}
+evaluate_pseudotime_all_clinical <- function(cds, clinical_columns = c("braaksc", "cogn_global_lv", "ceradsc", "amyloid")) {
+  # Check that all clinical columns exist in colData
+  missing_columns <- setdiff(clinical_columns, colnames(colData(cds)))
+  if (length(missing_columns) > 0) {
+    stop(paste("The following columns are missing in colData:", paste(missing_columns, collapse = ", ")))
+  }
+  
+  # Initialize a results data frame to store metrics
+  results <- data.frame(
+    Clinical_Score = character(),
+    Spearman_Correlation = numeric(),
+    MSE = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Iterate through each clinical score column
+  for (clinical_column in clinical_columns) {
+    # Extract pseudotime and clinical data
+    pseudotime <- pseudotime(cds)  # Extract pseudotime
+    clinical_data <- colData(cds)[, clinical_column]
+    
+    # Filter out NA values
+    valid_indices <- !is.na(pseudotime) & !is.na(clinical_data)
+    pseudotime_valid <- pseudotime[valid_indices]
+    clinical_data_valid <- clinical_data[valid_indices]
+    
+    # Skip if no valid data points are available
+    if (length(pseudotime_valid) == 0 || length(clinical_data_valid) == 0) {
+      next
+    }
+    
+    # Compute metrics
+    spearman_correlation <- cor(pseudotime_valid, clinical_data_valid, method = "spearman")
+    mse <- mean((pseudotime_valid - clinical_data_valid)^2)
+    
+    # Append metrics to results data frame
+    results <- rbind(results, data.frame(
+      Clinical_Score = clinical_column,
+      Spearman_Correlation = spearman_correlation,
+      MSE = mse,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Return the results data frame
+  return(results)
+}
+
+# Example usage: Evaluate pseudotime relationships with clinical scores
+clinical_scores <- c("braaksc", "cogn_global_lv", "ceradsc", "amyloid")
+results <- evaluate_pseudotime_all_clinical(cds_root, clinical_scores)
+
+# View the results
+print(results)
+
+
+```
+
+
+```{r}
+pseudotime <- plot_cells(cds_root,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=TRUE,
+           label_branch_points=TRUE,
+           graph_label_size=3)
+ggsave(
+  filename = "graph/pseudotime_plot.pdf",  # File name
+  plot = pseudotime,            # The ggplot object
+  width = 8,                         # Width in inches
+  height = 6,                        # Height in inches
+  dpi = 300                          # Resolution (optional for PDFs)
+)
+pseudotime
+```
+
+```{r}
+ceradsc <- plot_cells(cds_root,
+           color_cells_by = "ceradsc",
+           label_cell_groups=FALSE,
+           label_leaves=TRUE,
+           label_branch_points=FALSE,
+           graph_label_size=2.5)
+ggsave(
+  filename = "graph/ceradsc_plot.pdf",  # File name
+  plot = ceradsc,            # The ggplot object
+  width = 8,                         # Width in inches
+  height = 6,                        # Height in inches
+  dpi = 300                          # Resolution (optional for PDFs)
+)
+ceradsc
+```

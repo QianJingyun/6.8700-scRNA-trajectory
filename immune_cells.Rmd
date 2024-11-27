@@ -1,0 +1,376 @@
+---
+title: "mitFinalProject"
+author: "jingyun"
+date: "2024-11-22"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Installing monocle3
+
+First, install Bioconductor, and a few Bioconductor dependencies that aren't automatically installed.
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+install.packages("BiocManager")
+#BiocManager::install(version = "3.14") # for R version 4.1
+BiocManager::install(version = "3.20") # for R version 4.4
+BiocManager::install(c('BiocGenerics', 'DelayedArray', 'DelayedMatrixStats',
+                       'limma', 'lme4', 'S4Vectors', 'SingleCellExperiment',
+                       'SummarizedExperiment', 'batchelor', 'HDF5Array',
+                       'terra', 'ggrastr'))
+```
+
+Second, install monocle3 through the cole-trapnell-lab GitHub, execute:
+
+```{r, eval=FALSE}
+install.packages("devtools")
+devtools::install_github('cole-trapnell-lab/monocle3')
+devtools::install_github("immunogenomics/lisi")
+install.packages("Matrix")
+install.packages("Seurat")
+install.packages("readr")
+install.packages("data.table")
+```
+
+Lastly, check that Monocle 3 was installed correctly. Start a new R session and run:
+
+```{r}
+library(monocle3)
+library(dplyr)
+#library(lisi)
+library("Matrix")
+library(Seurat)
+library(readr)
+library(data.table)
+library(ggplot2)
+```
+
+# Load the data
+
+From <https://compbio.mit.edu/ad_aging_brain/> I used Cell type-specific data, Immune_cells.rds
+
+```{r}
+immune_cells <- readRDS("data/Immune_cells.rds")
+```
+
+Process the dataframe to match the input requirement of cds dataset. Requirements:
+
+```{r echo=FALSE}
+knitr::include_graphics("graph/requirements.png")
+```
+
+```{r}
+expression_matrix <- GetAssayData(immune_cells, layer = "counts")
+cell_metadata <- immune_cells@meta.data
+
+#Checking the dim(expression_matrix) [1] 33538 83889
+#Checking the dim(cell_metadata) [1] 83889     2
+#Match the rows of cell_metadata by names of columns of expression matrix
+head(rownames(cell_metadata))
+head(colnames(expression_matrix))
+rownames_match <- rownames(cell_metadata) %in% colnames(expression_matrix)
+summary(rownames_match)
+# they all matched
+
+# Create gene metadata
+gene_metadata <- data.frame(
+    gene_short_name = rownames(expression_matrix)  # Placeholder for gene symbols
+)
+rownames(gene_metadata) <- rownames(expression_matrix)
+#Checking the dim(expression_matrix) [1] 33538 83889
+#Checking the dim(gene_metadata) [1] 33538     1
+```
+
+```{r}
+#load batch data
+batch_data <- read_tsv("data/batch_mapping_deidentified.tsv")
+cell_metadata$batch <- batch_data$batch[match(cell_metadata$subject, batch_data$subject)]
+
+#load patient metadata and change the identifier to subject
+patient_metadata <- read_tsv("data/dataset_652_basic_05-06-2021.tsv.gz")
+linking_file <- read_tsv("data/AD427_subject_projid_mapping.tsv")
+patient_metadata$subject <- linking_file$subject[match(patient_metadata$projid, linking_file$projid)]
+
+#load most relevant columns to cell_metadata
+columns_to_add <- c("cogn_global_lv", "braaksc", "ceradsc", "amyloid")
+cell_metadata <- merge(cell_metadata, patient_metadata[, c("subject", columns_to_add)], 
+                       by = "subject", all.x = TRUE)
+
+# Restore original row names
+rownames(cell_metadata) <- colnames(expression_matrix)
+```
+
+Sample fractions of the data
+```{r}
+# Filter cell_metadata for only T-cells
+tcell_metadata <- cell_metadata[cell_metadata$cell_type_high_resolution == "T cells", ]
+
+# Ensure the columns of expression_matrix match the filtered metadata
+tcell_expression_matrix <- expression_matrix[, colnames(expression_matrix) %in% rownames(tcell_metadata)]
+
+# Check dimensions of the filtered data
+dim(tcell_metadata)
+dim(tcell_expression_matrix)
+```
+
+
+Visualize the cell metadata
+```{r}
+# 1. Distribution of cell_type_high_resolution
+numerical_vars <- c("cogn_global_lv", "braaksc", "ceradsc", "amyloid")
+for (var in numerical_vars) {
+  ggplot(cell_metadata, aes_string(x = var)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Distribution of", var), x = var, y = "Count") +
+    theme(plot.title = element_text(hjust = 0.5)) -> p
+  print(p)
+}
+```
+```{r}
+for (var in numerical_vars) {
+  ggplot(cell_metadata, aes_string(x = "cell_type_high_resolution", y = var)) +
+    geom_boxplot(fill = "steelblue", color = "black", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Boxplot of", var, "by Cell Type"), x = "Cell Type", y = var) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          plot.title = element_text(hjust = 0.5)) -> p
+  print(p)
+}
+```
+```{r}
+# Select numerical variables and calculate correlations
+cor_data <- cell_metadata[, numerical_vars]
+cor_matrix <- cor(cor_data, use = "complete.obs")
+cor_matrix
+```
+
+
+```{r}
+cds <- new_cell_data_set(expression_matrix,
+                         cell_metadata = cell_metadata,
+                         gene_metadata = gene_metadata)
+tcell <- new_cell_data_set(tcell_expression_matrix,
+                         cell_metadata = tcell_metadata,
+                         gene_metadata = gene_metadata)
+```
+
+```{r echo=FALSE}
+knitr::include_graphics("graph/workflow.png")
+```
+
+# Clustering and classifying cells
+
+```{r}
+cds <- preprocess_cds(cds, num_dim = 100)
+```
+
+It's a good idea to check that you're using enough PCs to capture most of the variation in gene expression across all the cells in the data set. You can look at the fraction of variation explained by each PC using
+
+```{r}
+plot_pc_variance_explained(cds)
+```
+
+We can see that using more than 100 PCs would capture only a small amount of additional variation, and each additional PC makes downstream steps in Monocle slower.
+
+Reduce dimensionality and visualize the cells
+
+```{r}
+cds <- reduce_dimension(cds)
+plot_cells(cds, color_cells_by="cell_type_high_resolution")
+```
+
+## Batch correction
+
+```{r}
+batch_data <- read_tsv("data/batch_mapping_deidentified.tsv")
+cell_metadata$batch <- batch_data$batch[match(cell_metadata$subject, batch_data$subject)]
+```
+
+First, observe UMAP coloring the cells by batch
+
+```{r}
+plot_cells(cds, color_cells_by="batch", label_cell_groups=FALSE, alpha = 0.1)
+# qualitative evaluate batch effect lisi scores...
+
+```
+
+Dramatic batch effects are not evident in this data. If the data contained more substantial variation due to plate, we'd expect to see groups of cells that really only come from one plate. Nevertheless, we can try and remove what batch effect is by running the align_cds() function. This will be performed right before the trajectory analysis section below.
+
+## Group cells into clusters
+
+A pre-step for finding marker genes. We can use community detection. A network is said to have community structure if the nodes of the network can be easily grouped into (potentially overlapping) sets of nodes such that each set of nodes is densely connected internally
+
+```{r}
+cds <- cluster_cells(cds, resolution=1e-5)
+plot_cells(cds)
+```
+
+## Find marker genes expressed by each cluster
+
+Once cells have been clustered, we can ask what genes makes them different from one another. top_markers(): genes are evaluated for their association with specific cell groups.
+
+```{r}
+marker_test_res <- top_markers(cds, group_cells_by="partition", 
+                               reference_cells=1000, cores=8)
+```
+
+pseudo_R2, a metric reflecting how well the gene's expression is associated with the given cell group.
+
+```{r}
+top_specific_markers <- marker_test_res %>%
+                            filter(fraction_expressing >= 0.10) %>%
+                            group_by(cell_group) %>%
+                            top_n(3, pseudo_R2)
+
+top_specific_marker_ids <- unique(top_specific_markers %>% pull(gene_short_name))
+```
+
+Plot the expression and fraction of cells that express each marker in each group.
+
+```{r}
+plot_genes_by_group(cds,
+                    top_specific_marker_ids,
+                    group_cells_by="partition",
+                    ordering_type="maximal_on_diag",
+                    max.size=3)
+```
+
+# Trajectory Analysis
+
+```{r}
+cds_align <- align_cds(cds, alignment_group = "batch")
+```
+
+```{r}
+cds_align <- reduce_dimension(cds_align)
+plot_cells(cds_align, color_cells_by="batch", label_cell_groups=FALSE)
+```
+
+```{r}
+plot_cells(cds_align, label_groups_by_cluster=FALSE,  color_cells_by = "cell_type_high_resolution")
+```
+
+Visualize how individual genes vary along the trajectory.
+
+```{r}
+ciliated_genes <- c("CCDC26",
+                    "HSPA1A",
+                    "HS3ST4",
+                    "PLXDC2",
+                    "FYN",
+                    "CD247")
+
+plot_cells(cds,
+           genes=ciliated_genes,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+To deal with multiple ancestors, monocole partition cells into clusters. When you are learning trajectories, each partition will eventually become a separate trajectory.
+
+```{r}
+cds_align <- cluster_cells(cds_align)
+plot_cells(cds_align)
+```
+
+## Fit a principal graph within each partition and Order the cells in pseudotime
+
+Pseudotime is an abstract unit of progress: it's simply the distance between a cell and the start of the trajectory, measured along the shortest path. The trajectory's total length is defined in terms of the total amount of transcriptional change that a cell undergoes as it moves from the starting state to the end state.
+
+```{r}
+cds_align <- learn_graph(cds_align)
+plot_cells(cds_align,
+           color_cells_by = "cell_type_high_resolution",
+           label_groups_by_cluster=TRUE,
+           label_leaves=FALSE,
+           label_branch_points=TRUE)
+```
+
+Each leaf, denoted by light gray circles, corresponds to a different outcome (i.e. cell fate) of the trajectory. Black circles indicate branch nodes, in which cells can travel to one of several outcomes.
+
+## Manually select the start point
+
+```{r eval=FALSE}
+cds_align <- order_cells(cds_align)
+```
+
+```{r eval=FALSE}
+plot_cells(cds_align,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)
+```
+
+Instead of manually pick the start node, we can use a helper function.Essentially, we need to think of biologically relevant features or computational strategies to define the root nodes. 1. Since we have patients metadata, we can order them by the progression of disease.
+
+```{r}
+patient_metadata <- read.delim("data/individual_metadata_deidentified.tsv", header = TRUE, sep = "\t")
+patient_metadata2 <- read.delim("data/Supplementary_Table_1_sample_metadata.tsv", header = TRUE, sep = "\t")
+colData(cds_align)$Pathologic_diagnosis_of_AD <- patient_metadata$Pathologic_diagnosis_of_AD[match(colData(cds_align)$subject, patient_metadata$subject)]
+```
+
+The function below works by first selecting cells that match the specified diagnosis. It then determines which trajectory graph node each cell is closest to. - [cds\@principal](mailto:cds@principal){.email}\_graph_aux[["UMAP"]]\$pr_graph_cell_proj_closest_vertex: Retrieves the mapping of each cell to its closest vertex in the principal graph, using the UMAP embedding. Next, it identifies the node that is most frequently associated with the selected cells, effectively representing the node most occupied by cells with the given diagnosis. Finally, it returns this node as the root, which can serve as the starting point for trajectory inference.
+
+```{r}
+get_earliest_principal_node <- function(cds, diagnosis="no") {
+  # Select cells with the specified diagnosis
+  cell_ids <- which(colData(cds)[, "Pathologic_diagnosis_of_AD"] == diagnosis)
+  
+  # Retrieve the closest vertex information for each cell
+  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  
+  # Identify the root principal node based on the most frequent vertex
+  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names(
+    which.max(table(closest_vertex[cell_ids, ]))
+  ))]
+  
+  # Return the root principal node(s)
+  root_pr_nodes
+}
+
+cds_root <- order_cells(cds_align, root_pr_nodes=get_earliest_principal_node(cds_align, diagnosis="no"))
+```
+
+```{r}
+plot_cells(cds_root,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)
+```
+
+```{r}
+plot_cells(cds_root,
+           color_cells_by = "Pathologic_diagnosis_of_AD",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)
+```
+
+Questions: 1. Are certain cell types (e.g., from cell_type_high_resolution) enriched in one condition? a. Determine whether specific cell types are overrepresented in either Pathologic_diagnosis_of_AD = yes (AD) or no (non-AD) conditions.
+
+```{r}
+table(colData(cds_align)$cell_type_high_resolution, colData(cds_align)$Pathologic_diagnosis_of_AD)
+prop.table(table(colData(cds_align)$cell_type_high_resolution, colData(cds_align)$Pathologic_diagnosis_of_AD), margin = 2)
+```
+
+```{r}
+library(ggplot2)
+ggplot(as.data.frame(table(colData(cds_align)$cell_type_high_resolution, colData(cds_align)$Pathologic_diagnosis_of_AD)),
+       aes(x = Var2, y = Freq, fill = Var1)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(x = "Pathologic Diagnosis of AD", y = "Proportion", fill = "Cell Type") +
+  theme_minimal()
+```
